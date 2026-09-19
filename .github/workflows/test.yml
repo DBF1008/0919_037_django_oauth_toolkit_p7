@@ -1,0 +1,556 @@
+name: Test
+
+# Avoid duplicate CI runs on feature branches:
+# - run on push only for master
+# - run on pull_request for all PRs
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover-matrices:
+    name: Discover tox matrices
+    runs-on: ubuntu-latest
+    outputs:
+      core-matrix: ${{ steps.discover.outputs.core-matrix }}
+      postgres-matrix: ${{ steps.discover.outputs.postgres-matrix }}
+      postgres-standalone-matrix: ${{ steps.discover.outputs.postgres-standalone-matrix }}
+      postgres-pr-matrix: ${{ steps.discover.outputs.postgres-pr-matrix }}
+      mysql-matrix: ${{ steps.discover.outputs.mysql-matrix }}
+      mysql-standalone-matrix: ${{ steps.discover.outputs.mysql-standalone-matrix }}
+      mysql-pr-matrix: ${{ steps.discover.outputs.mysql-pr-matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Discover tox environments
+        id: discover
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          def py_factor_to_version(py_factor: str) -> str:
+            return f"{int(py_factor[0])}.{int(py_factor[1:])}"
+
+          def dj_factor_to_version(dj_factor: str) -> str:
+            if dj_factor == "main":
+              return "main"
+            return f"{int(dj_factor[0])}.{int(dj_factor[1:])}"
+
+          def list_envs(*args: str) -> list[str]:
+            result = subprocess.run(
+              ["tox", "list", "--no-desc", *args],
+              check=False,
+              capture_output=True,
+              text=True,
+            )
+            if result.returncode != 0:
+              raise RuntimeError(result.stderr.strip() or f"tox list failed: {' '.join(args)}")
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+          core_envs = list_envs("-f", "lite3")
+          postgres_envs = list_envs("-f", "pg16")
+          mysql_envs = list_envs("-f", "my84")
+
+          core = []
+          postgres_tests = {}
+          mysql_tests = {}
+          postgres_migrations = {}
+          mysql_migrations = {}
+
+          core_pat = re.compile(r"^py(\d+)-dj(\d+|main)-lite\d+(?:-[a-z0-9]+)?$")
+          pg_test_pat = re.compile(r"^py(\d+)-dj(\d+|main)-pg(\d+)(?:-([a-z0-9]+))?$")
+          my_test_pat = re.compile(r"^py(\d+)-dj(\d+|main)-my(\d+)(?:-([a-z0-9]+))?$")
+          pg_mig_pat = re.compile(r"^migrations-dj(\d+|main)-pg(\d+)(?:-([a-z0-9]+))?$")
+          my_mig_pat = re.compile(r"^migrations-dj(\d+|main)-my(\d+)(?:-([a-z0-9]+))?$")
+
+          for env in core_envs:
+            m = core_pat.match(env)
+            if m:
+              py_factor, dj_factor = m.groups()
+              core.append(
+                {
+                  "toxenv": env,
+                  "python-version": py_factor_to_version(py_factor),
+                  "django-version": dj_factor_to_version(dj_factor),
+                }
+              )
+          for env in postgres_envs:
+            m = pg_test_pat.match(env)
+            if m:
+              py_factor, dj_factor, db_version, topology = m.groups()
+              postgres_tests[(dj_factor, db_version, topology or "standalone")] = {
+                "toxenv": env,
+                "python-version": py_factor_to_version(py_factor),
+                "django-version": dj_factor_to_version(dj_factor),
+                "db-topology": topology or "standalone",
+              }
+              continue
+
+            m = pg_mig_pat.match(env)
+            if m:
+              dj_factor, db_version, topology = m.groups()
+              postgres_migrations[(dj_factor, db_version, topology or "standalone")] = env
+              continue
+
+          for env in mysql_envs:
+            m = my_test_pat.match(env)
+            if m:
+              py_factor, dj_factor, db_version, topology = m.groups()
+              mysql_tests[(dj_factor, db_version, topology or "standalone")] = {
+                "toxenv": env,
+                "python-version": py_factor_to_version(py_factor),
+                "django-version": dj_factor_to_version(dj_factor),
+                "db-topology": topology or "standalone",
+              }
+              continue
+
+            m = my_mig_pat.match(env)
+            if m:
+              dj_factor, db_version, topology = m.groups()
+              mysql_migrations[(dj_factor, db_version, topology or "standalone")] = env
+
+          def build_backend_matrix(tests: dict[tuple[str, str, str], dict[str, str]], migrations: dict[tuple[str, str, str], str], engine: str) -> list[dict[str, str]]:
+            rows = []
+            for key, test_entry in tests.items():
+              migration_toxenv = migrations.get(key)
+              if not migration_toxenv:
+                dj_factor, db_version, topology = key
+                raise RuntimeError(
+                  f"missing migrations-dj{dj_factor}-{engine}{db_version}{'-' + topology if topology != 'standalone' else ''} for {test_entry['toxenv']}"
+                )
+              rows.append({**test_entry, "migration_toxenv": migration_toxenv})
+            rows.sort(key=lambda x: x["toxenv"])
+            return rows
+
+          core.sort(key=lambda x: x["toxenv"])
+          postgres = build_backend_matrix(postgres_tests, postgres_migrations, "pg")
+          mysql = build_backend_matrix(mysql_tests, mysql_migrations, "my")
+          postgres_standalone = [row for row in postgres if row["db-topology"] == "standalone"]
+          postgres_pr = [row for row in postgres if row["db-topology"] == "pr"]
+          mysql_standalone = [row for row in mysql if row["db-topology"] == "standalone"]
+          mysql_pr = [row for row in mysql if row["db-topology"] == "pr"]
+
+          outputs = {
+            "core-matrix": {"include": core},
+            "postgres-matrix": {"include": postgres},
+            "postgres-standalone-matrix": {"include": postgres_standalone},
+            "postgres-pr-matrix": {"include": postgres_pr},
+            "mysql-matrix": {"include": mysql},
+            "mysql-standalone-matrix": {"include": mysql_standalone},
+            "mysql-pr-matrix": {"include": mysql_pr},
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            for name, value in outputs.items():
+              out.write(f"{name}={json.dumps(value, separators=(',', ':'))}\n")
+          PY
+
+  test-package:
+    needs: discover-matrices
+    name: DOT SQLite (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for Codecov OIDC token
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-matrices.outputs.core-matrix) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Get pip cache dir
+      id: pip-cache
+      run: |
+        echo "::set-output name=dir::$(pip cache dir)"
+
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.pip-cache.outputs.dir }}
+        key:
+          ${{ matrix.python-version }}-v1-${{ hashFiles('**/pyproject.toml') }}-${{ hashFiles('**/tox.ini') }}
+        restore-keys: |
+          ${{ matrix.python-version }}-v1-
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade tox
+
+    - name: Tox tests
+      run: tox -v -e ${{ matrix.toxenv }}
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v5
+      with:
+        name: Python ${{ matrix.python-version }}
+        use_oidc: true
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Run ruff checks
+        run: tox -e lint
+
+  sphinxlint:
+    name: Sphinx Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Run sphinx-lint
+        run: tox -e sphinxlint
+
+  migrations:
+    name: DOT Check Migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Check no missing migrations
+        run: tox -e migrations-dj52-lite3
+
+  scenario-migrate-swapped:
+    name: DOT Migrate Swapped Models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Run swapped model migrations
+        run: tox -e scenario-migrate-swapped-dj52-lite3
+
+  multi-db:
+    name: DOT Multi-DB Tests (Python 3.12, Django 4.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Run multi-db tests
+        run: tox -e py312-dj42-multi-db
+
+  postgres-standalone:
+    needs: discover-matrices
+    name: DOT PostgreSQL Standalone (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-matrices.outputs.postgres-standalone-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Start postgres standalone DB layer
+        run: docker compose -f docker-compose.postgres.yml up -d --wait
+        env:
+          POSTGRES_BIND_PORT: '5432'
+
+      - name: Run postgres standalone tests
+        run: tox -e ${{ matrix.toxenv }}
+        env:
+          POSTGRES_PORT: '5432'
+
+      - name: Run postgres standalone migration checks
+        run: tox -e ${{ matrix.migration_toxenv }}
+        env:
+          POSTGRES_PORT: '5432'
+
+      - name: Stop postgres standalone DB layer
+        if: always()
+        run: docker compose -f docker-compose.postgres.yml down -v
+        env:
+          POSTGRES_BIND_PORT: '5432'
+
+  postgres-pr:
+    needs: discover-matrices
+    name: DOT PostgreSQL Primary/Replica (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-matrices.outputs.postgres-pr-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Start postgres primary/replica DB layer
+        run: docker compose -f docker-compose.postgres-pr.yml up -d --wait
+        env:
+          POSTGRES_PRIMARY_BIND_PORT: '5432'
+          POSTGRES_REPLICA_BIND_PORT: '5433'
+
+      - name: Verify postgres primary/replica state
+        run: |
+          docker compose -f docker-compose.postgres-pr.yml exec -T postgres-replica \
+            psql -U dot -d dot -tAc "SELECT pg_is_in_recovery()" | grep -q t
+          docker compose -f docker-compose.postgres-pr.yml exec -T postgres-primary \
+            psql -U dot -d dot -tAc "SELECT count(*) FROM pg_stat_replication" | grep -Eq '^[1-9][0-9]*$'
+
+      - name: Run postgres primary/replica tests
+        run: tox -e ${{ matrix.toxenv }}
+        env:
+          POSTGRES_PRIMARY_HOST: '127.0.0.1'
+          POSTGRES_PRIMARY_PORT: '5432'
+          POSTGRES_REPLICA_HOST: '127.0.0.1'
+          POSTGRES_REPLICA_PORT: '5433'
+
+      - name: Run postgres primary/replica migration checks
+        run: tox -e ${{ matrix.migration_toxenv }}
+        env:
+          POSTGRES_PRIMARY_HOST: '127.0.0.1'
+          POSTGRES_PRIMARY_PORT: '5432'
+          POSTGRES_REPLICA_HOST: '127.0.0.1'
+          POSTGRES_REPLICA_PORT: '5433'
+
+      - name: Stop postgres primary/replica DB layer
+        if: always()
+        run: docker compose -f docker-compose.postgres-pr.yml down -v
+        env:
+          POSTGRES_PRIMARY_BIND_PORT: '5432'
+          POSTGRES_REPLICA_BIND_PORT: '5433'
+
+  mysql-standalone:
+    needs: discover-matrices
+    name: DOT MySQL Standalone (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-matrices.outputs.mysql-standalone-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Start mysql DB layer
+        run: docker compose -f docker-compose.mysql.yml up -d --wait
+        env:
+          MYSQL_BIND_PORT: '3306'
+
+      - name: Run mysql standalone tests
+        run: tox -e ${{ matrix.toxenv }}
+        env:
+          MYSQL_PORT: '3306'
+
+      - name: Run mysql migration checks
+        run: tox -e ${{ matrix.migration_toxenv }}
+        env:
+          MYSQL_PORT: '3306'
+
+      - name: Stop mysql DB layer
+        if: always()
+        run: docker compose -f docker-compose.mysql.yml down -v
+        env:
+          MYSQL_BIND_PORT: '3306'
+
+  mysql-pr:
+    needs: discover-matrices
+    name: DOT MySQL Primary/Replica (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-matrices.outputs.mysql-pr-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tox
+        run: python -m pip install --upgrade tox
+
+      - name: Start mysql primary/replica DB layer
+        run: docker compose -f docker-compose.mysql-pr.yml up -d --wait
+        env:
+          MYSQL_PRIMARY_BIND_PORT: '3306'
+          MYSQL_REPLICA_BIND_PORT: '3307'
+
+      - name: Verify mysql primary/replica state
+        run: |
+          docker compose -f docker-compose.mysql-pr.yml exec -T mysql-primary \
+            mysql -udot -pdot -e "SELECT @@server_id" | grep -q 1
+          docker compose -f docker-compose.mysql-pr.yml exec -T mysql-replica \
+            mysql -udot -pdot -e "SELECT @@server_id" | grep -q 2
+          docker compose -f docker-compose.mysql-pr.yml exec -T mysql-replica \
+            mysql -uroot -pdot -e "SHOW REPLICA STATUS\\G" | grep -q "Replica_IO_Running: Yes"
+          docker compose -f docker-compose.mysql-pr.yml exec -T mysql-replica \
+            mysql -uroot -pdot -e "SHOW REPLICA STATUS\\G" | grep -q "Replica_SQL_Running: Yes"
+
+      - name: Run mysql primary/replica tests
+        run: tox -e ${{ matrix.toxenv }}
+        env:
+          MYSQL_PRIMARY_HOST: '127.0.0.1'
+          MYSQL_PRIMARY_PORT: '3306'
+          MYSQL_REPLICA_HOST: '127.0.0.1'
+          MYSQL_REPLICA_PORT: '3307'
+
+      - name: Run mysql primary/replica migration checks
+        run: tox -e ${{ matrix.migration_toxenv }}
+        env:
+          MYSQL_PRIMARY_HOST: '127.0.0.1'
+          MYSQL_PRIMARY_PORT: '3306'
+          MYSQL_REPLICA_HOST: '127.0.0.1'
+          MYSQL_REPLICA_PORT: '3307'
+
+      - name: Stop mysql primary/replica DB layer
+        if: always()
+        run: docker compose -f docker-compose.mysql-pr.yml down -v
+        env:
+          MYSQL_PRIMARY_BIND_PORT: '3306'
+          MYSQL_REPLICA_BIND_PORT: '3307'
+
+  test-demo-rp:
+    name: Demo Relying Party
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - "22.x"
+          - "24.x"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: tests/app/rp
+
+      - name: Run Lint
+        run: npm run lint
+        working-directory: tests/app/rp
+
+      - name: Run build
+        run: npm run build
+        working-directory: tests/app/rp
+
+  codecov-notify:
+    needs:
+      - test-package
+      - test-demo-rp
+    runs-on: ubuntu-latest
+    name: Codecov Notify
+    permissions:
+      id-token: write # Required for Codecov OIDC token
+    steps:
+      # - tell codecov to send notifications now that all jobs are complete.
+      #   without this, codecov may notify before all coverage reports have been uploaded.
+      #   `codecov: notify: manual_trigger: true` must be set in codecov.yml, to prevent
+      #   processing on every upload.
+      # - preferred to after_n_builds so we don't need to update that number every
+      #   time we add/remove jobs.
+      - name: Notify Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          run_command: 'send-notifications'
+          use_oidc: true
+
+  success:
+    needs:
+      - test-package
+      - test-demo-rp
+      - codecov-notify
+      - lint
+      - sphinxlint
+      - migrations
+      - scenario-migrate-swapped
+      - multi-db
+      - postgres-standalone
+      - postgres-pr
+      - mysql-standalone
+      - mysql-pr
+    runs-on: ubuntu-latest
+    name: Test successful
+    steps:
+      - name: Success
+        run: echo Test successful

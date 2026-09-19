@@ -1,0 +1,49 @@
+volumes:
+  idp-data:
+
+
+x-idp: &idp
+  image: django-oauth-toolkit/idp
+  volumes:
+    - idp-data:/data
+
+services:
+  idp-migrate:
+    <<: *idp
+    build: .
+    command: python manage.py migrate
+
+  idp-loaddata:
+    <<: *idp
+    command: python manage.py loaddata fixtures/seed.json
+    depends_on:
+      idp-migrate:
+        condition: service_completed_successfully
+
+  idp:
+    <<: *idp
+    # Uses the image's default CMD (gunicorn idp.wsgi:application from
+    # WORKDIR /code/tests/app/idp). Do not add --chdir=/code: the idp package
+    # lives under /code/tests/app/idp, so changing to /code breaks the import.
+    ports:
+      # map to dev port.
+      - "8000:80"
+    # To override templates in the distributable image, mount a host directory
+    # (read-only) at /templates. Files there shadow the bundled defaults, e.g.
+    # ./my-templates/registration/login.html overrides the login page. Static
+    # files are served by WhiteNoise from inside the image; no mount required.
+    # volumes:
+    #   - idp-data:/data
+    #   - ./my-templates:/templates:ro
+    depends_on:
+      idp-loaddata:
+        condition: service_completed_successfully
+
+  rp:
+    image: django-oauth-toolkit/rp
+    build: ./tests/app/rp
+    ports:
+      # map to dev port.
+      - "5173:3000"
+    depends_on:
+      - idp
