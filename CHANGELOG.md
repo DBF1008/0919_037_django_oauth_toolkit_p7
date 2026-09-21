@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+* Unified error handling: new `RecoverableError` (HTTP 503 `temporarily_unavailable`) and
+  `ServerError` (HTTP 500 `server_error`) exception classes, plus
+  `OAuthLibMixin.error_response_to_http()` which maps `OAuthToolkitError`s to standard OAuth2
+  JSON responses. The token and revocation endpoints now handle non-JSON/empty error bodies
+  instead of failing on `json.loads`.
+* Structured request logging via `oauth2_provider.log_utils` (`client_id`, `grant_type`,
+  `user_id`, `request_id` fields on the `oauth2_provider` logger) and a new
+  `oauth2_provider.middleware.RequestIDMiddleware` (configurable `REQUEST_ID_HEADER` setting,
+  default `X-Request-ID`).
+
 ### Deprecated
 * Deprecate the `AUTHENTICATION_SERVER_EXP_TIME_ZONE` setting. Token introspection `exp` values are
   Unix timestamps and are always interpreted as UTC per RFC 7662/RFC 7519. The setting still works

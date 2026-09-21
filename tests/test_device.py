@@ -539,7 +539,7 @@ class TestDeviceFlow(DeviceFlowBaseTestCase):
             ("authorization-pending", '{"error": "authorization_pending"}', 400),
             ("expired", '{"error": "expired_token"}', 400),
             ("denied", '{"error": "access_denied"}', 400),
-            ("LOL_status", '{"error": "internal_error"}', 500),
+            ("LOL_status", '{"error": "server_error"}', 500),
         ]
         for invalid_state, expected_error_message, expected_error_code in testcases:
             device.status = invalid_state

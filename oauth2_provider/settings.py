@@ -67,6 +67,9 @@ DEFAULTS = {
     "REFRESH_TOKEN_REUSE_PROTECTION": False,
     "ROTATE_REFRESH_TOKEN": True,
     "ERROR_RESPONSE_WITH_SCOPES": False,
+    # WSGI/META name of the request header carrying the correlation request id
+    # used by oauth2_provider.middleware.RequestIDMiddleware.
+    "REQUEST_ID_HEADER": "HTTP_X_REQUEST_ID",
     "APPLICATION_MODEL": APPLICATION_MODEL,
     "ACCESS_TOKEN_MODEL": ACCESS_TOKEN_MODEL,
     "ID_TOKEN_MODEL": ID_TOKEN_MODEL,

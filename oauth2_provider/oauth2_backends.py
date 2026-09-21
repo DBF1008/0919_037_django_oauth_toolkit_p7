@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from urllib.parse import urlparse, urlunparse
 
 from django.http import HttpRequest
@@ -7,7 +8,12 @@ from oauthlib.common import Request as OauthlibRequest
 from oauthlib.common import quote, urlencode, urlencoded
 from oauthlib.oauth2 import OAuth2Error
 
-from .exceptions import FatalClientError, OAuthToolkitError
+from .exceptions import FatalClientError, OAuthToolkitError, RecoverableError, ServerError
+from .log_utils import (
+    bind_log_context,
+    reset_log_context,
+    update_log_context_from_request,
+)
 from .settings import oauth2_settings
 
 
@@ -27,6 +33,26 @@ class OAuthLibCore:
         validator = validator_class()
         server_kwargs = oauth2_settings.server_kwargs
         self.server = server or oauth2_settings.OAUTH2_SERVER_CLASS(validator, **server_kwargs)
+
+    @contextmanager
+    def _log_context(self, django_request):
+        """
+        Bind a structured logging context for the duration of an oauthlib
+        interaction. The context is populated from the Django request and from
+        the oauthlib request that can be reconstructed from its body, and is
+        always reset afterwards so values never leak across requests.
+        """
+        update_log_context_from_request(django_request)
+        try:
+            uri, http_method, body, headers = self._extract_params(django_request)
+            oauth_request = OauthlibRequest(uri, http_method, body, headers)
+            update_log_context_from_request(oauth_request)
+            request_id = getattr(django_request, "request_id", None)
+            if request_id:
+                bind_log_context(request_id=request_id)
+            yield
+        finally:
+            reset_log_context()
 
     def _get_escaped_full_path(self, request):
         """
@@ -104,17 +130,18 @@ class OAuthLibCore:
 
         :param request: The current django.http.HttpRequest object
         """
-        try:
-            uri, http_method, body, headers = self._extract_params(request)
-            scopes, credentials = self.server.validate_authorization_request(
-                uri, http_method=http_method, body=body, headers=headers
-            )
+        with self._log_context(request):
+            try:
+                uri, http_method, body, headers = self._extract_params(request)
+                scopes, credentials = self.server.validate_authorization_request(
+                    uri, http_method=http_method, body=body, headers=headers
+                )
 
-            return scopes, credentials
-        except oauth2.FatalClientError as error:
-            raise FatalClientError(error=error)
-        except oauth2.OAuth2Error as error:
-            raise OAuthToolkitError(error=error)
+                return scopes, credentials
+            except oauth2.FatalClientError as error:
+                raise FatalClientError(error=error)
+            except oauth2.OAuth2Error as error:
+                raise OAuthToolkitError(error=error)
 
     def create_authorization_response(self, request, scopes, credentials, allow):
         """
@@ -127,39 +154,41 @@ class OAuthLibCore:
                            `client_id`, `state`, `redirect_uri`, `response_type`
         :param allow: True if the user authorize the client, otherwise False
         """
-        try:
-            if not allow:
-                raise oauth2.AccessDeniedError(state=credentials.get("state", None))
+        with self._log_context(request):
+            try:
+                if not allow:
+                    raise oauth2.AccessDeniedError(state=credentials.get("state", None))
 
-            # add current user to credentials. this will be used by OAUTH2_VALIDATOR_CLASS
-            credentials["user"] = request.user
-            request_uri, http_method, _, request_headers = self._extract_params(request)
+                # add current user to credentials. this will be used by OAUTH2_VALIDATOR_CLASS
+                credentials["user"] = request.user
+                request_uri, http_method, _, request_headers = self._extract_params(request)
 
-            headers, body, status = self.server.create_authorization_response(
-                uri=request_uri,
-                http_method=http_method,
-                headers=request_headers,
-                scopes=scopes,
-                credentials=credentials,
-            )
-            uri = headers.get("Location", None)
+                headers, body, status = self.server.create_authorization_response(
+                    uri=request_uri,
+                    http_method=http_method,
+                    headers=request_headers,
+                    scopes=scopes,
+                    credentials=credentials,
+                )
+                uri = headers.get("Location", None)
 
-            return uri, headers, body, status
+                return uri, headers, body, status
 
-        except oauth2.FatalClientError as error:
-            raise FatalClientError(error=error, redirect_uri=credentials["redirect_uri"])
-        except oauth2.OAuth2Error as error:
-            raise OAuthToolkitError(error=error, redirect_uri=credentials["redirect_uri"])
+            except oauth2.FatalClientError as error:
+                raise FatalClientError(error=error, redirect_uri=credentials["redirect_uri"])
+            except oauth2.OAuth2Error as error:
+                raise OAuthToolkitError(error=error, redirect_uri=credentials["redirect_uri"])
 
     def create_device_authorization_response(self, request: HttpRequest):
-        uri, http_method, body, headers = self._extract_params(request)
-        try:
-            headers, body, status = self.server.create_device_authorization_response(
-                uri, http_method, body, headers
-            )
-            return headers, body, status
-        except OAuth2Error as exc:
-            return exc.headers, exc.json, exc.status_code
+        with self._log_context(request):
+            uri, http_method, body, headers = self._extract_params(request)
+            try:
+                headers, body, status = self.server.create_device_authorization_response(
+                    uri, http_method, body, headers
+                )
+                return headers, body, status
+            except OAuth2Error as exc:
+                return exc.headers, exc.json, exc.status_code
 
     def create_token_response(self, request):
         """
@@ -167,17 +196,22 @@ class OAuthLibCore:
 
         :param request: The current django.http.HttpRequest object
         """
-        uri, http_method, body, headers = self._extract_params(request)
-        extra_credentials = self._get_extra_credentials(request)
+        with self._log_context(request):
+            uri, http_method, body, headers = self._extract_params(request)
+            extra_credentials = self._get_extra_credentials(request)
 
-        try:
-            headers, body, status = self.server.create_token_response(
-                uri, http_method, body, headers, extra_credentials
-            )
-            uri = headers.get("Location", None)
-            return uri, headers, body, status
-        except OAuth2Error as exc:
-            return None, exc.headers, exc.json, exc.status_code
+            try:
+                headers, body, status = self.server.create_token_response(
+                    uri, http_method, body, headers, extra_credentials
+                )
+                uri = headers.get("Location", None)
+                return uri, headers, body, status
+            except OAuth2Error as exc:
+                return None, exc.headers, exc.json, exc.status_code
+            except RecoverableError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any other failure is a server error
+                raise ServerError(error=exc) from exc
 
     def create_revocation_response(self, request):
         """
@@ -186,12 +220,20 @@ class OAuthLibCore:
 
         :param request: The current django.http.HttpRequest object
         """
-        uri, http_method, body, headers = self._extract_params(request)
+        with self._log_context(request):
+            uri, http_method, body, headers = self._extract_params(request)
 
-        headers, body, status = self.server.create_revocation_response(uri, http_method, body, headers)
-        uri = headers.get("Location", None)
+            try:
+                headers, body, status = self.server.create_revocation_response(
+                    uri, http_method, body, headers
+                )
+            except RecoverableError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - convert unexpected failures to server errors
+                raise ServerError(error=exc) from exc
+            uri = headers.get("Location", None)
 
-        return uri, headers, body, status
+            return uri, headers, body, status
 
     def create_userinfo_response(self, request):
         """
@@ -200,13 +242,14 @@ class OAuthLibCore:
 
         :param request: The current django.http.HttpRequest object
         """
-        uri, http_method, body, headers = self._extract_params(request)
-        try:
-            headers, body, status = self.server.create_userinfo_response(uri, http_method, body, headers)
-            uri = headers.get("Location", None)
-            return uri, headers, body, status
-        except OAuth2Error as exc:
-            return None, exc.headers, exc.json, exc.status_code
+        with self._log_context(request):
+            uri, http_method, body, headers = self._extract_params(request)
+            try:
+                headers, body, status = self.server.create_userinfo_response(uri, http_method, body, headers)
+                uri = headers.get("Location", None)
+                return uri, headers, body, status
+            except OAuth2Error as exc:
+                return None, exc.headers, exc.json, exc.status_code
 
     def verify_request(self, request, scopes):
         """

@@ -156,3 +156,92 @@ same namespace as before.
     ]
 
 This method also allows to remove some of the urls (such as managements) urls if you don't want them.
+
+.. _error-handling-and-logging:
+
+Error handling and structured logging
+=====================================
+
+.. versionadded:: 3.4.0
+
+Error classification
+--------------------
+
+Django OAuth Toolkit distinguishes three classes of errors, all defined in
+``oauth2_provider.exceptions``:
+
+* ``FatalClientError``: the request itself is invalid (for example a malicious
+  ``redirect_uri``) and the client must not repeat it unchanged.
+* ``RecoverableError``: a transient failure, such as an unavailable upstream
+  service. The client MAY retry. Mapped to ``503 Service Unavailable`` with the
+  ``temporarily_unavailable`` error code (:rfc:`5.2.5`).
+* ``ServerError``: an unexpected server-side failure. Mapped to
+  ``500 Internal Server Error`` with the ``server_error`` error code
+  (:rfc:`5.2`).
+
+``OAuthLibMixin.error_response_to_http(error)`` maps any
+``OAuthToolkitError`` (or an unexpected exception) to a standard JSON HTTP
+response. The token and revocation endpoints use it automatically, and
+non-JSON or empty error bodies returned by a custom oauthlib server are
+converted into well-formed ``server_error`` responses rather than crashing on
+``json.loads``.
+
+Structured logging
+------------------
+
+Every log record emitted under the ``oauth2_provider`` logger can carry the
+following correlation fields, which default to ``None`` when not applicable:
+
+``client_id``, ``grant_type``, ``user_id`` and ``request_id``.
+
+The values are held in a ``contextvars`` context (see
+``oauth2_provider.log_utils``), populated from the oauthlib request by the
+backend layer, and reset at the end of each request so they never leak across
+requests or threads.
+
+To give every request a correlation id, add the middleware early in
+``MIDDLEWARE``::
+
+    MIDDLEWARE = [
+        # ...
+        "oauth2_provider.middleware.RequestIDMiddleware",
+        # ...
+    ]
+
+An incoming ``X-Request-ID`` header is reused (configure another header with
+the ``REQUEST_ID_HEADER`` setting); otherwise a UUID4 is generated. The id is
+available as ``request.request_id`` and echoed in the response header.
+
+Attach ``StructuredLogFilter`` and reference the fields in a formatter to
+render structured output::
+
+    LOGGING = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "oauth2_structured": {
+                "format": "%(levelname)s %(message)s "
+                "client_id=%(client_id)s grant_type=%(grant_type)s "
+                "user_id=%(user_id)s request_id=%(request_id)s",
+            },
+        },
+        "filters": {
+            "oauth2_structured": {
+                "()": "oauth2_provider.log_utils.StructuredLogFilter",
+            },
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "oauth2_structured",
+                "filters": ["oauth2_structured"],
+            },
+        },
+        "loggers": {
+            "oauth2_provider": {
+                "handlers": ["console"],
+                "level": "DEBUG",
+                "propagate": False,
+            },
+        },
+    }

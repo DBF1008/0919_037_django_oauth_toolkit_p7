@@ -13,7 +13,30 @@ class OAuthToolkitError(Exception):
 
 class FatalClientError(OAuthToolkitError):
     """
-    Class for critical errors
+    Class for critical errors caused by the client (e.g. a malicious
+    redirect_uri or client_id). The client cannot recover by retrying the
+    same request.
+    """
+
+    pass
+
+
+class RecoverableError(OAuthToolkitError):
+    """
+    Class for transient errors (e.g. temporary unavailability of an upstream
+    service) after which the client MAY retry the request. Mapped to an HTTP
+    ``503 Service Unavailable`` response with the OAuth2
+    ``temporarily_unavailable`` error code as per :rfc:`5.2.5`.
+    """
+
+    pass
+
+
+class ServerError(OAuthToolkitError):
+    """
+    Class for unexpected server-side failures that are not the client's fault.
+    Mapped to an HTTP ``500 Internal Server Error`` response with the OAuth2
+    ``server_error`` error code as per :rfc:`5.2`.
     """
 
     pass

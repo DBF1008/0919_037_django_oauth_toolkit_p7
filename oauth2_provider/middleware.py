@@ -1,13 +1,56 @@
 import hashlib
 import logging
+import uuid
 
 from django.contrib.auth import authenticate
 from django.utils.cache import patch_vary_headers
 
+from oauth2_provider.log_utils import bind_log_context, reset_log_context
 from oauth2_provider.models import get_access_token_model
+from oauth2_provider.settings import oauth2_settings
 
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("oauth2_provider")
+
+DEFAULT_REQUEST_ID_HEADER = "HTTP_X_REQUEST_ID"
+
+
+class RequestIDMiddleware:
+    """
+    Middleware that assigns a request ID to every request and exposes it to
+    the structured logging context.
+
+    If the incoming request carries a request ID header (``X-Request-ID`` by
+    default, configurable through ``REQUEST_ID_HEADER``), its value is reused
+    so that IDs can be propagated across services. Otherwise a random UUID4 is
+    generated. The ID is:
+
+    * stored on ``request.request_id``,
+    * pushed into the structured logging context (``request_id`` field), and
+    * echoed back to the client through the response header.
+
+    The context-var based context is always reset once the response has been
+    produced, so IDs never leak between requests regardless of thread reuse.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def _get_header_name(self):
+        return getattr(oauth2_settings, "REQUEST_ID_HEADER", DEFAULT_REQUEST_ID_HEADER)
+
+    def __call__(self, request):
+        header_name = self._get_header_name()
+        request_id = request.META.get(header_name) or uuid.uuid4().hex
+        request.request_id = request_id
+        bind_log_context(request_id=request_id)
+
+        try:
+            response = self.get_response(request)
+            response[header_name.replace("HTTP_", "").replace("_", "-").title()] = request_id
+            return response
+        finally:
+            reset_log_context()
 
 
 class OAuth2TokenMiddleware:
@@ -61,6 +104,6 @@ class OAuth2ExtraTokenMiddleware:
                 token = AccessToken.objects.get(token_checksum=token_checksum)
                 request.access_token = token
             except AccessToken.DoesNotExist as e:
-                log.exception(e)
+                log.exception("OAuth2 access token not found", exc_info=e)
         response = self.get_response(request)
         return response

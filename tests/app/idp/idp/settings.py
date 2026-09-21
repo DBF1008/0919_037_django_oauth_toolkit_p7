@@ -128,6 +128,9 @@ MIDDLEWARE = [
     "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
+    # Attach a correlation request id (X-Request-ID) to every request and make
+    # it available in oauth2_provider structured logs.
+    "oauth2_provider.middleware.RequestIDMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
@@ -227,9 +230,25 @@ os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = env("OAUTHLIB_INSECURE_TRANSPORT")
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "formatters": {
+        "oauth2_structured": {
+            # client_id, grant_type, user_id and request_id are injected by
+            # oauth2_provider.log_utils.StructuredLogFilter.
+            "format": "%(levelname)s %(message)s "
+            "client_id=%(client_id)s grant_type=%(grant_type)s "
+            "user_id=%(user_id)s request_id=%(request_id)s",
+        },
+    },
+    "filters": {
+        "oauth2_structured": {
+            "()": "oauth2_provider.log_utils.StructuredLogFilter",
+        },
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
+            "formatter": "oauth2_structured",
+            "filters": ["oauth2_structured"],
         },
     },
     "root": {

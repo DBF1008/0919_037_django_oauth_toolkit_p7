@@ -1,10 +1,14 @@
+import json
 import logging
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
-from django.http import HttpRequest, HttpResponseForbidden, HttpResponseNotFound
+from django.http import HttpRequest, HttpResponse, HttpResponseForbidden, HttpResponseNotFound
+from oauthlib.oauth2.rfc6749.errors import ServerError as OAuthLibServerError
+from oauthlib.oauth2.rfc6749.errors import TemporarilyUnavailableError
 
-from ..exceptions import FatalClientError
+from ..exceptions import FatalClientError, OAuthToolkitError, RecoverableError, ServerError
+from ..log_utils import log_event
 from ..scopes import get_scopes_backend
 from ..settings import oauth2_settings
 
@@ -199,6 +203,88 @@ class OAuthLibMixin:
             redirect = True
 
         return redirect, error_response
+
+    @staticmethod
+    def _parse_oauth2_body(body):
+        """
+        Parse the JSON body returned by oauthlib.
+
+        Some custom server configurations may return empty or non-JSON bodies;
+        in that case return ``None`` instead of raising, so callers can fall back
+        to a well-formed OAuth2 error payload.
+        """
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _http_response_from_oauthlib_error(error, status=None):
+        """
+        Build a standard ``application/json`` :class:`~django.http.HttpResponse`
+        from an oauthlib error object.
+        """
+        response_status = status or error.status_code
+        response = HttpResponse(
+            content=error.json,
+            status=response_status,
+            content_type="application/json",
+        )
+        for key, value in error.headers.items():
+            response[key] = value
+        return response
+
+    def server_error_response(self):
+        """
+        Return a standards-compliant HTTP 500 response carrying the OAuth2
+        ``server_error`` code (see :rfc:`5.2`).
+        """
+        return self._http_response_from_oauthlib_error(OAuthLibServerError(), status=500)
+
+    def error_response_to_http(self, error):
+        """
+        Map an :class:`~oauth2_provider.exceptions.OAuthToolkitError` to a
+        standard HTTP response.
+
+        Error classification follows :rfc:`5.2`:
+
+        * :class:`FatalClientError` (and generic ``OAuthToolkitError``): the
+          response produced by oauthlib is returned unchanged, typically a
+          4xx status code.
+        * :class:`RecoverableError`: ``503 Service Unavailable`` with the
+          ``temporarily_unavailable`` error code; clients MAY retry.
+        * :class:`ServerError`: ``500 Internal Server Error`` with the
+          ``server_error`` error code.
+        """
+        if isinstance(error, RecoverableError):
+            log_event("warning", "Recoverable error, returning 503", exc_info=error)
+            oauthlib_error = error.oauthlib_error
+            if not hasattr(oauthlib_error, "json"):
+                oauthlib_error = TemporarilyUnavailableError()
+            return self._http_response_from_oauthlib_error(oauthlib_error, status=503)
+
+        if isinstance(error, ServerError):
+            log_event("error", "Server error, returning 500", exc_info=error)
+            oauthlib_error = error.oauthlib_error
+            if not hasattr(oauthlib_error, "json"):
+                oauthlib_error = OAuthLibServerError()
+            return self._http_response_from_oauthlib_error(oauthlib_error, status=500)
+
+        if isinstance(error, FatalClientError) or isinstance(error, OAuthToolkitError):
+            oauthlib_error = error.oauthlib_error
+            if hasattr(oauthlib_error, "json"):
+                log_event(
+                    "info",
+                    "OAuth2 client error",
+                    error=getattr(oauthlib_error, "error", None),
+                )
+                return self._http_response_from_oauthlib_error(oauthlib_error)
+
+        # An unexpected, unclassified exception: never leak details to clients.
+        log_event("error", "Unexpected error, returning 500", exc_info=error)
+        return self.server_error_response()
 
     def authenticate_client(self, request):
         """Returns a boolean representing if client is authenticated with client credentials

@@ -299,14 +299,28 @@ class TokenView(OAuthLibMixin, View):
     def authorization_flow_token_response(
         self, request: http.HttpRequest, *args, **kwargs
     ) -> http.HttpResponse:
-        url, headers, body, status = self.create_token_response(request)
+        try:
+            url, headers, body, status = self.create_token_response(request)
+        except OAuthToolkitError as error:
+            return self.error_response_to_http(error)
+
         if status == 200:
-            access_token = json.loads(body).get("access_token")
+            payload = self._parse_oauth2_body(body)
+            if payload is None:
+                log.warning("Token endpoint returned a non-JSON 200 response body")
+                return self.server_error_response()
+            access_token = payload.get("access_token")
             if access_token is not None:
                 token_checksum = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
                 token = get_access_token_model().objects.get(token_checksum=token_checksum)
                 app_authorized.send(sender=self, request=request, token=token)
-        response = HttpResponse(content=body, status=status)
+
+            response = http.JsonResponse(data=payload, status=status)
+        else:
+            payload = self._parse_oauth2_body(body)
+            if payload is None:
+                return self.server_error_response()
+            response = http.JsonResponse(data=payload, status=status)
 
         for k, v in headers.items():
             response[k] = v
@@ -342,10 +356,7 @@ class TokenView(OAuthLibMixin, View):
             # all the possible values for status. However, it does act as a
             # reminder for developers when they add, in the future, new values
             # (such as slow_down) that they must handle here.
-            return http.HttpResponseServerError(
-                content='{"error": "internal_error"}',
-                content_type="application/json",
-            )
+            return self.server_error_response()
         else:
             # AUTHORIZED is the only accepted state, anything else is
             # rejected.
@@ -358,8 +369,15 @@ class TokenView(OAuthLibMixin, View):
                 content_type="application/json",
             )
 
-        url, headers, body, status = self.create_token_response(request)
-        response = http.JsonResponse(data=json.loads(body), status=status)
+        try:
+            url, headers, body, status = self.create_token_response(request)
+        except OAuthToolkitError as error:
+            return self.error_response_to_http(error)
+
+        payload = self._parse_oauth2_body(body)
+        if payload is None:
+            return self.server_error_response()
+        response = http.JsonResponse(data=payload, status=status)
 
         if status != 200:
             return response
@@ -384,8 +402,17 @@ class RevokeTokenView(OAuthLibMixin, View):
     """
 
     def post(self, request, *args, **kwargs):
-        url, headers, body, status = self.create_revocation_response(request)
-        response = HttpResponse(content=body or "", status=status)
+        try:
+            url, headers, body, status = self.create_revocation_response(request)
+        except OAuthToolkitError as error:
+            return self.error_response_to_http(error)
+
+        payload = self._parse_oauth2_body(body)
+        if payload is not None:
+            response = http.JsonResponse(data=payload, status=status)
+        else:
+            # RFC 7009: a successful revocation response returns an empty 200 body.
+            response = HttpResponse(content=body or "", status=status)
 
         for k, v in headers.items():
             response[k] = v

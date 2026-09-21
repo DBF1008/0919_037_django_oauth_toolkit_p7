@@ -270,6 +270,17 @@ ERROR_RESPONSE_WITH_SCOPES
 When authorization fails due to insufficient scopes include the required scopes in the response.
 Only applicable when used with `Django REST Framework <http://django-rest-framework.org/>`_
 
+REQUEST_ID_HEADER
+~~~~~~~~~~~~~~~~~
+.. versionadded:: 3.4.0
+
+The ``request.META`` key of the header used by
+``oauth2_provider.middleware.RequestIDMiddleware`` to read (and echo back) the
+correlation request identifier. Defaults to ``HTTP_X_REQUEST_ID`` (the
+``X-Request-ID`` header). When the header is absent, a random UUID4 is
+generated instead. The identifier is also exposed in the structured logging
+context as the ``request_id`` field.
+
 RESOURCE_SERVER_INTROSPECTION_URL
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The introspection endpoint for validating token remotely (RFC7662). This URL requires either an authorization

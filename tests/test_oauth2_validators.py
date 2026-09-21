@@ -564,13 +564,10 @@ class TestOAuth2ValidatorErrorResourceToken(TestCase):
                 self.validator._get_token_from_authentication_server(
                     self.token, self.introspection_url, self.introspection_token, None
                 )
-                self.assertIn(
-                    "ERROR:oauth2_provider:Introspection: Failed to "
-                    "get a valid response from authentication server. "
-                    "Status code: 404, Reason: "
-                    "Not Found.\nNoneType: None",
-                    mock_log.output,
-                )
+                self.assertEqual(len(mock_log.output), 1)
+                self.assertIn("Introspection endpoint returned an error response", mock_log.output[0])
+                self.assertIn("status_code=404", mock_log.output[0])
+                self.assertIn("reason='Not Found'", mock_log.output[0])
 
 
 @pytest.mark.oauth2_settings(presets.OIDC_SETTINGS_RW)
