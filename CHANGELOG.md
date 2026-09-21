@@ -15,6 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+* Unified error handling and structured logging for the OAuth/OIDC endpoints.
+  `oauth2_provider.exceptions` now provides `RecoverableError` (mapped to HTTP
+  503 `temporarily_unavailable`) and `ServerError` (mapped to HTTP 500
+  `server_error`); `OAuthLibMixin.error_response_to_http` maps every
+  `OAuthToolkitError` to a standards compliant JSON response and
+  `build_oauth_http_response` safely handles empty or non-JSON bodies returned
+  by OAuthLib (token, revocation, device and userinfo endpoints).
+* New `oauth2_provider.middleware.RequestIDMiddleware` that honors/generates an
+  `X-Request-ID` header, exposes it as `request.request_id` and binds it to the
+  logging context via `contextvars`.
+* New `oauth2_provider.logging_utils` module with structured (`StructuredFormatter`)
+  and text (`ContextFormatter`) formatters; all `oauth2_provider` log records now
+  carry `request_id`, `client_id`, `grant_type` and `user_id` fields, and
+  authentication failures log machine readable events without leaking secrets.
+
+### Changed
+* Token, revocation, device authorization and userinfo backends now catch
+  unexpected exceptions and return RFC 6749 `server_error` responses instead of
+  letting the exception propagate.
+
 ### Deprecated
 * Deprecate the `AUTHENTICATION_SERVER_EXP_TIME_ZONE` setting. Token introspection `exp` values are
   Unix timestamps and are always interpreted as UTC per RFC 7662/RFC 7519. The setting still works

@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 
 from django.contrib.auth import logout
 from django.contrib.auth.models import AnonymousUser
-from django.http import HttpResponse, JsonResponse
+from django.http import JsonResponse
 from django.urls import reverse
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
@@ -150,12 +150,8 @@ class UserInfoView(OIDCOnlyMixin, OAuthLibMixin, View):
         return self._create_userinfo_response(request)
 
     def _create_userinfo_response(self, request):
-        url, headers, body, status = self.create_userinfo_response(request)
-        response = HttpResponse(content=body or "", status=status)
-
-        for k, v in headers.items():
-            response[k] = v
-        return response
+        result = self.create_userinfo_response(request)
+        return self.build_oauth_http_response(result)
 
 
 def _load_id_token(token):

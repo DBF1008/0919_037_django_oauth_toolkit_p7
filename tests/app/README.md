@@ -65,6 +65,31 @@ curl --location 'http://localhost:8000/o/token/' \
 
 The response should include the access token.
 
+### Structured logs and request IDs
+
+The IDP enables `oauth2_provider.middleware.RequestIDMiddleware` and renders
+`oauth2_provider` logs as JSON via `oauth2_provider.logging_utils.StructuredFormatter`
+(see `idp/settings.py`). Every log line carries `request_id`, `client_id`,
+`grant_type` and `user_id` when those are known.
+
+Send an `X-Request-ID` header and the IDP echoes it back, including on error
+responses which are RFC 6749 compliant (`500`/`server_error`, `503`/
+`temporarily_unavailable`):
+
+```sh
+curl -i --location 'http://127.0.0.1:8000/o/token/' \
+    --header 'Content-Type: application/x-www-form-urlencoded' \
+    --header 'X-Request-ID: demo-request-42' \
+    --data-urlencode 'grant_type=client_credentials' \
+    --data-urlencode 'client_id=Qg8AaxKLs1c2W3PR70Sv5QxuSEREicKUlf83iGX3'
+```
+
+Check the runserver console for a JSON line such as:
+
+```json
+{"timestamp": "...", "level": "INFO", "message": "Token request succeeded", "request_id": "demo-request-42", "event": "token_request_success"}
+```
+
 ## /test/app/rp
 
 This is an example RP. It is a SPA built with Svelte.

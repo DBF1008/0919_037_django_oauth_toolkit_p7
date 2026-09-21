@@ -123,6 +123,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "oauth2_provider.middleware.RequestIDMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -227,9 +228,17 @@ os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = env("OAUTHLIB_INSECURE_TRANSPORT")
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "formatters": {
+        # Every oauth2_provider log line is rendered as a JSON object carrying
+        # request_id, client_id, grant_type and user_id (when available).
+        "oauth_structured": {
+            "()": "oauth2_provider.logging_utils.StructuredFormatter",
+        },
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
+            "formatter": "oauth_structured",
         },
     },
     "root": {

@@ -9,6 +9,7 @@ from django.utils.timezone import now, timedelta
 from oauth2_provider.backends import get_oauthlib_core
 from oauth2_provider.models import get_access_token_model, get_application_model, redirect_to_uri_allowed
 from oauth2_provider.oauth2_backends import JSONOAuthLibCore, OAuthLibCore
+from tests import presets
 from tests.common_testing import OAuth2ProviderTestCase as TestCase
 
 
@@ -222,3 +223,111 @@ def test_uri_loopback_redirect_check(uri, expected_result):
         assert redirect_to_uri_allowed(uri, allowed_uris)
     else:
         assert not redirect_to_uri_allowed(uri, allowed_uris)
+
+
+@pytest.mark.usefixtures("oauth2_settings")
+class TestUnifiedErrorHandling(TestCase):
+    factory = RequestFactory()
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.oauthlib_core = OAuthLibCore()
+
+    def _request(self, payload=""):
+        return self.factory.post(
+            "/o/token/",
+            payload,
+            content_type="application/x-www-form-urlencoded",
+        )
+
+    def test_unexpected_token_server_failure_becomes_500_tuple(self):
+        request = self._request("grant_type=client_credentials")
+        with mock.patch.object(
+            self.oauthlib_core.server,
+            "create_token_response",
+            side_effect=RuntimeError("db down"),
+        ):
+            with self.assertLogs("oauth2_provider", level="ERROR") as logs:
+                uri, headers, body, status = self.oauthlib_core.create_token_response(request)
+        self.assertEqual(status, 500)
+        self.assertIsNone(uri)
+        self.assertEqual(json.loads(body)["error"], "server_error")
+        self.assertEqual(logs.records[0].event, "token_request_failure")
+
+    def test_oauth2_error_on_token_endpoint_returns_error_tuple(self):
+        from oauthlib.oauth2.rfc6749.errors import InvalidClientError
+
+        request = self._request("grant_type=client_credentials")
+        with mock.patch.object(
+            self.oauthlib_core.server,
+            "create_token_response",
+            side_effect=InvalidClientError(),
+        ):
+            uri, headers, body, status = self.oauthlib_core.create_token_response(request)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"], "invalid_client")
+
+    def test_unexpected_revocation_failure_becomes_500_tuple(self):
+        request = self._request("token=abc")
+        with mock.patch.object(
+            self.oauthlib_core.server,
+            "create_revocation_response",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertLogs("oauth2_provider", level="ERROR") as logs:
+                uri, headers, body, status = self.oauthlib_core.create_revocation_response(request)
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["error"], "server_error")
+        self.assertEqual(logs.records[0].event, "revocation_request_failure")
+
+    def test_extract_params_binds_structured_log_context(self):
+        from oauth2_provider.logging_utils import get_log_context, reset_log_context
+
+        reset_log_context()
+        request = self.factory.post(
+            "/o/token/",
+            {"grant_type": "password", "client_id": "ctx-client"},
+        )
+        request.request_id = "ctx-req"
+        self.oauthlib_core._extract_params(request)
+        context = get_log_context()
+        self.assertEqual(context["request_id"], "ctx-req")
+        self.assertEqual(context["client_id"], "ctx-client")
+        self.assertEqual(context["grant_type"], "password")
+        reset_log_context()
+
+
+@pytest.mark.usefixtures("oauth2_settings")
+class TestJSONOAuthLibCoreInvalidBody(TestCase):
+    factory = RequestFactory()
+
+    def test_invalid_json_body_returns_empty_and_logs(self):
+        request = self.factory.post("/o/token/", "{not json", content_type="application/json")
+        with self.assertLogs("oauth2_provider", level="WARNING") as logs:
+            body = JSONOAuthLibCore().extract_body(request)
+        self.assertEqual(body, "")
+        self.assertEqual(logs.records[0].event, "invalid_json_body")
+
+    def test_json_non_object_body_returns_empty_and_logs(self):
+        request = self.factory.post("/o/token/", "[1, 2, 3]", content_type="application/json")
+        with self.assertLogs("oauth2_provider", level="WARNING") as logs:
+            body = JSONOAuthLibCore().extract_body(request)
+        self.assertEqual(body, "")
+        self.assertEqual(logs.records[0].event, "invalid_json_body")
+
+
+@pytest.mark.oauth2_settings(presets.OIDC_SETTINGS_RW)
+def test_unexpected_userinfo_failure_becomes_500_tuple(oauth2_settings, caplog):
+    factory = RequestFactory()
+    oidc_core = OAuthLibCore()
+    request = factory.get("/o/userinfo/")
+    caplog.set_level("ERROR", logger="oauth2_provider")
+    with mock.patch.object(
+        type(oidc_core.server),
+        "create_userinfo_response",
+        side_effect=RuntimeError("boom"),
+    ):
+        uri, headers, body, status = oidc_core.create_userinfo_response(request)
+    assert status == 500
+    assert json.loads(body)["error"] == "server_error"
+    assert caplog.records[0].event == "userinfo_request_failure"

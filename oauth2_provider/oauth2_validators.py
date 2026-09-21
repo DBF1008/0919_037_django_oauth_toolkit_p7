@@ -29,6 +29,7 @@ from oauthlib.oauth2.rfc6749 import errors, utils
 from oauthlib.openid import RequestValidator
 
 from .exceptions import FatalClientError
+from .logging_utils import bind_log_context, get_oauth_logger, log_context, log_event
 from .models import (
     AbstractApplication,
     get_access_token_model,
@@ -42,7 +43,7 @@ from .settings import oauth2_settings
 from .utils import get_timezone
 
 
-log = logging.getLogger("oauth2_provider")
+log = get_oauth_logger("oauth2_provider")
 
 GRANT_TYPE_MAPPING = {
     "authorization_code": (
@@ -148,37 +149,75 @@ class OAuth2Validator(RequestValidator):
         try:
             b64_decoded = base64.b64decode(auth_string)
         except (TypeError, binascii.Error):
-            log.debug("Failed basic auth: %r can't be decoded as base64", auth_string)
+            log_event(
+                log,
+                logging.DEBUG,
+                "client_auth_failed",
+                "Basic auth header is not valid base64",
+                reason="invalid_base64",
+            )
             return False
 
         try:
             auth_string_decoded = b64_decoded.decode(encoding)
         except UnicodeDecodeError:
-            log.debug("Failed basic auth: %r can't be decoded as unicode by %r", auth_string, encoding)
+            log_event(
+                log,
+                logging.DEBUG,
+                "client_auth_failed",
+                "Basic auth header cannot be decoded with the request charset",
+                reason="invalid_encoding",
+                encoding=encoding,
+            )
             return False
 
         try:
             client_id, client_secret = map(unquote_plus, auth_string_decoded.split(":", 1))
         except ValueError:
-            log.debug("Failed basic auth, Invalid base64 encoding.")
+            log_event(
+                log,
+                logging.DEBUG,
+                "client_auth_failed",
+                "Basic auth header does not contain a client_id/client_secret pair",
+                reason="malformed_credentials",
+            )
             return False
 
-        if self._load_application(client_id, request) is None:
-            log.debug("Failed basic auth: Application %s does not exist" % client_id)
-            return False
-        elif request.client.client_id != client_id:
-            log.debug("Failed basic auth: wrong client id %s" % client_id)
-            return False
-        elif (
-            request.client.client_type == "public"
-            and request.grant_type == "urn:ietf:params:oauth:grant-type:device_code"
-        ):
-            return True
-        elif not self._check_secret(client_secret, request.client.client_secret):
-            log.debug("Failed basic auth: wrong client secret %s" % client_secret)
-            return False
-        else:
-            return True
+        with log_context(client_id=client_id, grant_type=getattr(request, "grant_type", None)):
+            if self._load_application(client_id, request) is None:
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "client_auth_failed",
+                    "Basic auth failed: application does not exist",
+                    reason="unknown_client",
+                )
+                return False
+            elif request.client.client_id != client_id:
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "client_auth_failed",
+                    "Basic auth failed: loaded client does not match the provided client_id",
+                    reason="client_id_mismatch",
+                )
+                return False
+            elif (
+                request.client.client_type == "public"
+                and request.grant_type == "urn:ietf:params:oauth:grant-type:device_code"
+            ):
+                return True
+            elif not self._check_secret(client_secret, request.client.client_secret):
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "client_auth_failed",
+                    "Basic auth failed: wrong client secret",
+                    reason="invalid_client_secret",
+                )
+                return False
+            else:
+                return True
 
     def _authenticate_request_body(self, request):
         """
@@ -196,19 +235,32 @@ class OAuth2Validator(RequestValidator):
         except AttributeError:
             return False
 
-        if self._load_application(client_id, request) is None:
-            log.debug("Failed body auth: Application %s does not exists" % client_id)
-            return False
-        elif (
-            request.client.client_type == "public"
-            and request.grant_type == "urn:ietf:params:oauth:grant-type:device_code"
-        ):
-            return True
-        elif not self._check_secret(client_secret, request.client.client_secret):
-            log.debug("Failed body auth: wrong client secret %s" % client_secret)
-            return False
-        else:
-            return True
+        with log_context(client_id=client_id, grant_type=getattr(request, "grant_type", None)):
+            if self._load_application(client_id, request) is None:
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "client_auth_failed",
+                    "Request body auth failed: application does not exist",
+                    reason="unknown_client",
+                )
+                return False
+            elif (
+                request.client.client_type == "public"
+                and request.grant_type == "urn:ietf:params:oauth:grant-type:device_code"
+            ):
+                return True
+            elif not self._check_secret(client_secret, request.client.client_secret):
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "client_auth_failed",
+                    "Request body auth failed: wrong client secret",
+                    reason="invalid_client_secret",
+                )
+                return False
+            else:
+                return True
 
     def _load_application(self, client_id, request):
         """
@@ -268,7 +320,14 @@ class OAuth2Validator(RequestValidator):
                 ]
             )
         else:
-            log.warning("OAuth2 access token is invalid for an unknown reason.")
+            log_event(
+                log,
+                logging.WARNING,
+                "access_token_invalid",
+                "OAuth2 access token rejected but no specific reason matched",
+                reason="unknown",
+                scopes=list(scopes),
+            )
             error = OrderedDict(
                 [
                     ("error", "invalid_token"),
@@ -301,11 +360,21 @@ class OAuth2Validator(RequestValidator):
             if request.client_id and request.client_secret:
                 return True
         except AttributeError:
-            log.debug("Client ID or client secret not provided...")
-            pass
+            log_event(
+                log,
+                logging.DEBUG,
+                "client_auth_not_required",
+                "Client ID or client secret not provided",
+            )
 
-        self._load_application(request.client_id, request)
-        log.debug("Determining if client authentication is required for client %r", request.client)
+        self._load_application(getattr(request, "client_id", None), request)
+        bind_log_context(client_id=getattr(getattr(request, "client", None), "client_id", None))
+        log_event(
+            log,
+            logging.DEBUG,
+            "client_auth_required_check",
+            "Determining if client authentication is required",
+        )
         if request.client:
             return request.client.client_type == AbstractApplication.CLIENT_CONFIDENTIAL
 
@@ -322,11 +391,17 @@ class OAuth2Validator(RequestValidator):
         directly utilize the HTTP Basic authentication scheme.
         See rfc:`2.3.1` for more details
         """
+        bind_log_context(
+            client_id=getattr(request, "client_id", None),
+            grant_type=getattr(request, "grant_type", None),
+        )
         authenticated = self._authenticate_basic_auth(request)
 
         if not authenticated:
             authenticated = self._authenticate_request_body(request)
 
+        if authenticated:
+            bind_log_context(client_id=getattr(request.client, "client_id", None))
         return authenticated
 
     def authenticate_client_id(self, client_id, request, *args, **kwargs):
@@ -407,22 +482,39 @@ class OAuth2Validator(RequestValidator):
         try:
             response = requests.post(introspection_url, data={"token": token}, headers=headers)
         except requests.exceptions.RequestException:
-            log.exception("Introspection: Failed POST to %r in token lookup", introspection_url)
+            log_event(
+                log,
+                logging.ERROR,
+                "introspection_request_failed",
+                "Introspection: request to authentication server failed",
+                exc_info=True,
+                introspection_url=introspection_url,
+            )
             return None
 
         # Log an exception when response from auth server is not successful
         if response.status_code != http.client.OK:
-            log.exception(
-                "Introspection: Failed to get a valid response "
-                "from authentication server. Status code: {}, "
-                "Reason: {}.".format(response.status_code, response.reason)
+            log_event(
+                log,
+                logging.ERROR,
+                "introspection_response_invalid",
+                "Introspection: authentication server returned an error response",
+                status_code=response.status_code,
+                reason=response.reason,
+                introspection_url=introspection_url,
             )
             return None
 
         try:
             content = response.json()
         except ValueError:
-            log.exception("Introspection: Failed to parse response as json")
+            log_event(
+                log,
+                logging.ERROR,
+                "introspection_response_invalid",
+                "Introspection: failed to parse authentication server response as JSON",
+                introspection_url=introspection_url,
+            )
             return None
 
         if "active" in content and content["active"] is True:
@@ -470,6 +562,10 @@ class OAuth2Validator(RequestValidator):
         """
         When users try to access resources, check that provided token is valid
         """
+        bind_log_context(
+            client_id=getattr(getattr(request, "client", None), "client_id", None),
+            grant_type=getattr(request, "grant_type", None),
+        )
         if not token:
             return False
 
@@ -509,6 +605,15 @@ class OAuth2Validator(RequestValidator):
     def validate_code(self, client_id, code, client, request, *args, **kwargs):
         try:
             grant = Grant.objects.get(code=code, application=client)
+            if grant.is_expired():
+                log_event(
+                    log,
+                    logging.DEBUG,
+                    "authorization_code_invalid",
+                    "Authorization code has expired",
+                    reason="expired_code",
+                    client_id=client_id,
+                )
             if not grant.is_expired():
                 request.scopes = grant.scope.split(" ")
                 request.user = grant.user
@@ -517,9 +622,25 @@ class OAuth2Validator(RequestValidator):
                 if grant.claims:
                     request.claims = json.loads(grant.claims)
                 return True
+            log_event(
+                log,
+                logging.DEBUG,
+                "authorization_code_invalid",
+                "Authorization code does not exist for the authenticated client",
+                reason="unknown_code",
+                client_id=client_id,
+            )
             return False
 
         except Grant.DoesNotExist:
+            log_event(
+                log,
+                logging.DEBUG,
+                "authorization_code_invalid",
+                "Authorization code does not exist for the authenticated client",
+                reason="unknown_code",
+                client_id=client_id,
+            )
             return False
 
     def validate_grant_type(self, client_id, grant_type, client, request, *args, **kwargs):
@@ -785,6 +906,11 @@ class OAuth2Validator(RequestValidator):
         """
         Check username and password correspond to a valid and active User
         """
+        bind_log_context(
+            client_id=getattr(client, "client_id", None),
+            grant_type=getattr(request, "grant_type", "password"),
+            user_id=username,
+        )
         # Passing the optional HttpRequest adds compatibility for backends
         # which depend on its presence. Create one with attributes likely
         # to be used.
@@ -796,7 +922,15 @@ class OAuth2Validator(RequestValidator):
         u = authenticate(http_request, username=username, password=password)
         if u is not None and u.is_active:
             request.user = u
+            bind_log_context(user_id=u.get_username())
             return True
+        log_event(
+            log,
+            logging.DEBUG,
+            "resource_owner_auth_failed",
+            "Resource owner credentials rejected or user inactive",
+            reason="invalid_credentials",
+        )
         return False
 
     def get_original_scopes(self, refresh_token, request, *args, **kwargs):

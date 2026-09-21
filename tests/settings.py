@@ -68,6 +68,7 @@ TEMPLATES = [
 ]
 
 MIDDLEWARE = (
+    "oauth2_provider.middleware.RequestIDMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",

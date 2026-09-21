@@ -1,4 +1,5 @@
 import json
+import logging
 from urllib.parse import urlparse, urlunparse
 
 from django.http import HttpRequest
@@ -7,8 +8,37 @@ from oauthlib.common import Request as OauthlibRequest
 from oauthlib.common import quote, urlencode, urlencoded
 from oauthlib.oauth2 import OAuth2Error
 
-from .exceptions import FatalClientError, OAuthToolkitError
+from .exceptions import FatalClientError, OAuthToolkitError, ServerError, as_oauthlib_error
+from .logging_utils import bind_log_context, get_oauth_logger, log_event
 from .settings import oauth2_settings
+
+
+log = get_oauth_logger("oauth2_provider")
+
+
+def _bind_request_context(request):
+    """
+    Populate the structured logging context fields from the raw Django request.
+
+    The fields are also populated (possibly with more accurate values) later
+    by the validator once oauthlib has parsed the request.
+    """
+    context = {}
+    if hasattr(request, "request_id"):
+        context["request_id"] = request.request_id
+    post_client_id = request.POST.get("client_id")
+    if post_client_id:
+        context["client_id"] = post_client_id
+    grant_type = request.POST.get("grant_type")
+    if grant_type:
+        context["grant_type"] = grant_type
+    # Only consume an already resolved user. Accessing ``request.user``
+    # directly triggers DRF's lazy authentication, which calls back into this
+    # method while verifying a bearer token and would recurse forever.
+    cached_user = getattr(request, "_cached_user", None) or request.__dict__.get("user")
+    if cached_user is not None and getattr(cached_user, "is_authenticated", False):
+        context["user_id"] = cached_user.get_username()
+    bind_log_context(**context)
 
 
 class OAuthLibCore:
@@ -61,6 +91,7 @@ class OAuthLibCore:
         http_method = request.method
         headers = self.extract_headers(request)
         body = urlencode(self.extract_body(request))
+        _bind_request_context(request)
         return uri, http_method, body, headers
 
     def extract_headers(self, request):
@@ -159,7 +190,24 @@ class OAuthLibCore:
             )
             return headers, body, status
         except OAuth2Error as exc:
+            log_event(
+                log,
+                logging.INFO,
+                "device_authorization_error",
+                "Device authorization request rejected: {}".format(exc.error),
+                error=exc.error,
+            )
             return exc.headers, exc.json, exc.status_code
+        except Exception:
+            log_event(
+                log,
+                logging.ERROR,
+                "device_authorization_failure",
+                "Unexpected failure while handling device authorization",
+                exc_info=True,
+            )
+            server_error = as_oauthlib_error(ServerError())
+            return server_error.headers, server_error.json, server_error.status_code
 
     def create_token_response(self, request):
         """
@@ -175,9 +223,28 @@ class OAuthLibCore:
                 uri, http_method, body, headers, extra_credentials
             )
             uri = headers.get("Location", None)
+            if status == 200:
+                log_event(log, logging.INFO, "token_request_success", "Token request succeeded")
             return uri, headers, body, status
         except OAuth2Error as exc:
+            log_event(
+                log,
+                logging.INFO,
+                "token_request_error",
+                "Token request rejected: {}".format(exc.error),
+                error=exc.error,
+            )
             return None, exc.headers, exc.json, exc.status_code
+        except Exception:
+            log_event(
+                log,
+                logging.ERROR,
+                "token_request_failure",
+                "Unexpected failure while issuing a token",
+                exc_info=True,
+            )
+            server_error = as_oauthlib_error(ServerError())
+            return None, server_error.headers, server_error.json, server_error.status_code
 
     def create_revocation_response(self, request):
         """
@@ -188,10 +255,29 @@ class OAuthLibCore:
         """
         uri, http_method, body, headers = self._extract_params(request)
 
-        headers, body, status = self.server.create_revocation_response(uri, http_method, body, headers)
-        uri = headers.get("Location", None)
-
-        return uri, headers, body, status
+        try:
+            headers, body, status = self.server.create_revocation_response(uri, http_method, body, headers)
+            uri = headers.get("Location", None)
+            return uri, headers, body, status
+        except OAuth2Error as exc:
+            log_event(
+                log,
+                logging.INFO,
+                "revocation_request_error",
+                "Revocation request rejected: {}".format(exc.error),
+                error=exc.error,
+            )
+            return None, exc.headers, exc.json, exc.status_code
+        except Exception:
+            log_event(
+                log,
+                logging.ERROR,
+                "revocation_request_failure",
+                "Unexpected failure while revoking a token",
+                exc_info=True,
+            )
+            server_error = as_oauthlib_error(ServerError())
+            return None, server_error.headers, server_error.json, server_error.status_code
 
     def create_userinfo_response(self, request):
         """
@@ -206,7 +292,24 @@ class OAuthLibCore:
             uri = headers.get("Location", None)
             return uri, headers, body, status
         except OAuth2Error as exc:
+            log_event(
+                log,
+                logging.INFO,
+                "userinfo_request_error",
+                "UserInfo request rejected: {}".format(exc.error),
+                error=exc.error,
+            )
             return None, exc.headers, exc.json, exc.status_code
+        except Exception:
+            log_event(
+                log,
+                logging.ERROR,
+                "userinfo_request_failure",
+                "Unexpected failure while handling userinfo request",
+                exc_info=True,
+            )
+            server_error = as_oauthlib_error(ServerError())
+            return None, server_error.headers, server_error.json, server_error.status_code
 
     def verify_request(self, request, scopes):
         """
@@ -242,13 +345,28 @@ class JSONOAuthLibCore(OAuthLibCore):
         :return: provided POST parameters "urlencodable"
         """
         try:
-            body = json.loads(request.body.decode("utf-8")).items()
+            decoded = request.body.decode("utf-8")
         except AttributeError:
-            body = ""
+            return ""
+        try:
+            parsed = json.loads(decoded)
         except ValueError:
-            body = ""
-
-        return body
+            log_event(
+                log,
+                logging.WARNING,
+                "invalid_json_body",
+                "Request declared an application/json body but the payload is not valid JSON",
+            )
+            return ""
+        if not isinstance(parsed, dict):
+            log_event(
+                log,
+                logging.WARNING,
+                "invalid_json_body",
+                "application/json request body must be a JSON object, got {}".format(type(parsed).__name__),
+            )
+            return ""
+        return parsed.items()
 
 
 def get_oauthlib_core():

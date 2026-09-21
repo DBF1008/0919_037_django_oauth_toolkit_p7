@@ -1,15 +1,29 @@
+import json
 import logging
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
-from django.http import HttpRequest, HttpResponseForbidden, HttpResponseNotFound
+from django.http import (
+    HttpRequest,
+    HttpResponse,
+    HttpResponseForbidden,
+    HttpResponseNotFound,
+    JsonResponse,
+)
 
-from ..exceptions import FatalClientError
+from ..exceptions import (
+    FatalClientError,
+    OAuthToolkitError,
+    RecoverableError,
+    ServerError,
+    as_oauthlib_error,
+)
+from ..logging_utils import get_oauth_logger, log_event
 from ..scopes import get_scopes_backend
 from ..settings import oauth2_settings
 
 
-log = logging.getLogger("oauth2_provider")
+log = get_oauth_logger("oauth2_provider")
 
 SAFE_HTTP_METHODS = ["GET", "HEAD", "OPTIONS"]
 
@@ -167,6 +181,104 @@ class OAuthLibMixin:
                 raise SuspiciousOperation(error)
             else:
                 raise
+
+    @staticmethod
+    def _build_http_response(body, status, headers=None):
+        """
+        Build an HTTP response from an OAuthLib ``(body, status, headers)``
+        result, tolerating bodies that are empty or not valid JSON.
+
+        OAuthLib token/device/userinfo endpoints return JSON serialized
+        bodies, while the revocation endpoint returns an empty body on
+        success (see :rfc:`2.2`). Non JSON bodies are forwarded verbatim
+        instead of raising :class:`json.JSONDecodeError`.
+        """
+        headers = headers or {}
+        if not body:
+            response = HttpResponse(content="", status=status)
+        else:
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError):
+                log_event(
+                    log,
+                    logging.ERROR,
+                    "invalid_oauth_response_body",
+                    "OAuth endpoint returned a body that is not valid JSON",
+                    status=status,
+                )
+                response = HttpResponse(content=body, status=status, content_type="application/json")
+            else:
+                response = JsonResponse(data=payload, status=status, safe=False)
+
+        for key, value in headers.items():
+            response[key] = value
+
+        # :rfc:`5.1` requires error responses not to be cached.
+        if status >= 400:
+            response["Cache-Control"] = "no-store"
+            response["Pragma"] = "no-cache"
+        return response
+
+    def build_oauth_http_response(self, result):
+        """
+        Convert an OAuthLib backend result tuple into an
+        :class:`~django.http.HttpResponse`.
+
+        ``result`` is either a 3-tuple ``(headers, body, status)`` (device
+        authorization endpoint) or a 4-tuple ``(uri, headers, body, status)``
+        (token, revocation and userinfo endpoints).
+        """
+        if len(result) == 4:
+            _uri, headers, body, status = result
+        else:
+            headers, body, status = result
+        return self._build_http_response(body, status, headers)
+
+    def error_response_to_http(self, error, status=None, headers=None, description=None):
+        """
+        Map an :class:`~oauth2_provider.exceptions.OAuthToolkitError` (or a
+        plain exception wrapped in one) to a standards compliant HTTP
+        response.
+
+        * :class:`RecoverableError` -> ``503`` with ``temporarily_unavailable``
+        * :class:`ServerError` -> ``500`` with ``server_error``
+        * :class:`FatalClientError` -> ``400`` using the wrapped error
+        * any other :class:`OAuthToolkitError` -> the wrapped error status
+
+        The response body follows the JSON error format of :rfc:`5.2` and
+        carries the ``no-store`` cache directives from :rfc:`5.1`.
+        """
+        if not isinstance(error, OAuthToolkitError):
+            error = ServerError(error=as_oauthlib_error(error), description=description)
+
+        if isinstance(error, RecoverableError):
+            level = logging.WARNING
+            event = "recoverable_oauth_error"
+        elif isinstance(error, ServerError):
+            level = logging.ERROR
+            event = "server_oauth_error"
+        elif isinstance(error, FatalClientError):
+            level = logging.WARNING
+            event = "fatal_client_oauth_error"
+        else:
+            level = logging.INFO
+            event = "oauth_error"
+
+        log_event(
+            log,
+            level,
+            event,
+            "OAuth error mapped to HTTP response: {}".format(
+                getattr(error.oauthlib_error, "error", "server_error")
+            ),
+            error=getattr(error.oauthlib_error, "error", "server_error"),
+        )
+
+        oauthlib_error = error.oauthlib_error
+        response_status = status if status is not None else oauthlib_error.status_code
+        response = self._build_http_response(oauthlib_error.json, response_status, headers)
+        return response
 
     def get_scopes(self):
         """
@@ -331,7 +443,12 @@ class OIDCOnlyMixin:
         if not oauth2_settings.OIDC_ENABLED:
             if settings.DEBUG:
                 raise ImproperlyConfigured(self.debug_error_message)
-            log.warning(self.debug_error_message)
+            log_event(
+                log,
+                logging.WARNING,
+                "oidc_disabled",
+                self.debug_error_message,
+            )
             return HttpResponseNotFound()
         return super().dispatch(*args, **kwargs)
 
@@ -355,6 +472,11 @@ class OIDCLogoutOnlyMixin(OIDCOnlyMixin):
         if not oauth2_settings.OIDC_RP_INITIATED_LOGOUT_ENABLED:
             if settings.DEBUG:
                 raise ImproperlyConfigured(self.debug_error_message)
-            log.warning(self.debug_error_message)
+            log_event(
+                log,
+                logging.WARNING,
+                "oidc_disabled",
+                self.debug_error_message,
+            )
             return HttpResponseNotFound()
         return super().dispatch(*args, **kwargs)

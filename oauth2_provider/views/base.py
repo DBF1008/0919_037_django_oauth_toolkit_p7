@@ -6,7 +6,6 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 from django import http
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.views import redirect_to_login
-from django.http import HttpResponse
 from django.shortcuts import resolve_url
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -16,9 +15,10 @@ from django.views.generic import FormView, View
 from oauthlib.oauth2.rfc8628 import errors as rfc8628_errors
 
 from ..compat import login_not_required
-from ..exceptions import OAuthToolkitError
+from ..exceptions import OAuthToolkitError, ServerError
 from ..forms import AllowForm
 from ..http import OAuth2ResponseRedirect
+from ..logging_utils import get_oauth_logger, log_event
 from ..models import get_access_token_model, get_application_model, get_device_grant_model
 from ..scopes import get_scopes_backend
 from ..settings import oauth2_settings
@@ -26,7 +26,7 @@ from ..signals import app_authorized
 from .mixins import OAuthLibMixin
 
 
-log = logging.getLogger("oauth2_provider")
+log = get_oauth_logger("oauth2_provider")
 
 
 # login_not_required decorator to bypass LoginRequiredMiddleware
@@ -143,7 +143,12 @@ class AuthorizationView(BaseAuthorizationView, FormView):
             return self.error_response(error, application)
 
         self.success_url = uri
-        log.debug("Success url for the request: {0}".format(self.success_url))
+        log_event(
+            log,
+            logging.DEBUG,
+            "authorization_response_success",
+            "Success url for the request: {0}".format(self.success_url),
+        )
         return self.redirect(self.success_url, application)
 
     def get(self, request, *args, **kwargs):
@@ -301,16 +306,32 @@ class TokenView(OAuthLibMixin, View):
     ) -> http.HttpResponse:
         url, headers, body, status = self.create_token_response(request)
         if status == 200:
-            access_token = json.loads(body).get("access_token")
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError):
+                log_event(
+                    log,
+                    logging.ERROR,
+                    "invalid_oauth_response_body",
+                    "Token endpoint returned a success status with a body that is not JSON",
+                )
+                return self.error_response_to_http(ServerError())
+            access_token = payload.get("access_token")
             if access_token is not None:
                 token_checksum = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
-                token = get_access_token_model().objects.get(token_checksum=token_checksum)
+                try:
+                    token = get_access_token_model().objects.get(token_checksum=token_checksum)
+                except get_access_token_model().DoesNotExist:
+                    log_event(
+                        log,
+                        logging.ERROR,
+                        "issued_token_missing",
+                        "Issued access token not found in the database",
+                        exc_info=True,
+                    )
+                    return self.error_response_to_http(ServerError())
                 app_authorized.send(sender=self, request=request, token=token)
-        response = HttpResponse(content=body, status=status)
-
-        for k, v in headers.items():
-            response[k] = v
-        return response
+        return self.build_oauth_http_response((url, headers, body, status))
 
     def device_flow_token_response(
         self, request: http.HttpRequest, device_code: str, *args, **kwargs
@@ -359,14 +380,25 @@ class TokenView(OAuthLibMixin, View):
             )
 
         url, headers, body, status = self.create_token_response(request)
-        response = http.JsonResponse(data=json.loads(body), status=status)
-
         if status != 200:
-            return response
+            # The oauth2 device polling errors only carry status/body; upstream
+            # response headers are intentionally not forwarded here.
+            return self.build_oauth_http_response((url, {}, body, status))
 
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            log_event(
+                log,
+                logging.ERROR,
+                "invalid_oauth_response_body",
+                "Token endpoint returned a success status with a body that is not JSON",
+            )
+            return self.error_response_to_http(ServerError())
+
+        response = http.JsonResponse(data=payload, status=status)
         for k, v in headers.items():
             response[k] = v
-
         return response
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
@@ -384,9 +416,5 @@ class RevokeTokenView(OAuthLibMixin, View):
     """
 
     def post(self, request, *args, **kwargs):
-        url, headers, body, status = self.create_revocation_response(request)
-        response = HttpResponse(content=body or "", status=status)
-
-        for k, v in headers.items():
-            response[k] = v
-        return response
+        result = self.create_revocation_response(request)
+        return self.build_oauth_http_response(result)

@@ -40,6 +40,7 @@ Index
    views/details
    models
    advanced_topics
+   observability
    oidc
    signals
    settings
